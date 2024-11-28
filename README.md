@@ -1,2 +1,2 @@
 # Anuvaad
-Building an app that helps in translation between ISL and speech.
+Building an app that helps translate ISL and speech.
