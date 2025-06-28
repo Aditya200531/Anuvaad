@@ -1,0 +1,236 @@
+import os
+import cv2
+import numpy as np
+import mediapipe as mp
+from sklearn.model_selection import train_test_split
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, Dropout, LSTM
+from tensorflow.keras.regularizers import l2
+from tensorflow.keras.utils import to_categorical
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+import tensorflow as tf
+import matplotlib.pyplot as plt
+
+# Initialize MediaPipe Hands
+mp_hands = mp.solutions.hands
+hands = mp_hands.Hands(static_image_mode=True, max_num_hands=2, min_detection_confidence=0.5)
+mp_drawing = mp.solutions.drawing_utils
+
+# Path to the directory containing gesture videos
+VIDEO_DIR = r"D:/ISL/Gestures"  # Replace with your directory path
+
+# Automatically assign class labels based on subdirectory names
+LABELS = {gesture: idx for idx, gesture in enumerate(os.listdir(VIDEO_DIR))}
+print("Class Labels:", LABELS)
+
+def normalize_keypoints(keypoints, num_points=21):
+    """Normalize keypoints to handle variable number of hands"""
+    if len(keypoints) == 0:
+        return np.zeros(num_points * 3)
+    
+    # Convert to numpy array if not already
+    keypoints = np.array(keypoints)
+    
+    # Normalize coordinates relative to the first point (wrist)
+    base_point = keypoints[0]
+    normalized = keypoints - base_point
+    
+    # Scale to ensure consistent magnitude
+    max_dist = np.max(np.abs(normalized))
+    if max_dist > 0:
+        normalized = normalized / max_dist
+    
+    return normalized.flatten()
+
+def extract_keypoints_from_video(video_path):
+    print(f"Opening video: {video_path}")
+    cap = cv2.VideoCapture(video_path)
+    keypoints_sequences = []
+    sequence = []
+    frame_count = 0
+    
+    if not cap.isOpened():
+        print(f"Error: Could not open video file {video_path}")
+        return None
+
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        frame = cv2.resize(frame, (640, 480))
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = hands.process(rgb_frame)
+
+        frame_keypoints = []
+        if results.multi_hand_landmarks:
+            # Process primary hand
+            primary_hand = results.multi_hand_landmarks[0]
+            primary_keypoints = [[lm.x, lm.y, lm.z] for lm in primary_hand.landmark]
+            primary_keypoints = normalize_keypoints(primary_keypoints)
+            frame_keypoints.extend(primary_keypoints)
+
+            # Process second hand if present
+            if len(results.multi_hand_landmarks) > 1:
+                second_hand = results.multi_hand_landmarks[1]
+                second_keypoints = [[lm.x, lm.y, lm.z] for lm in second_hand.landmark]
+                second_keypoints = normalize_keypoints(second_keypoints)
+            else:
+                # Pad with zeros if no second hand
+                second_keypoints = np.zeros(63)  # 21 points * 3 coordinates
+            
+            frame_keypoints.extend(second_keypoints)
+        else:
+            # No hands detected, pad with zeros
+            frame_keypoints = np.zeros(126)  # 21 points * 3 coordinates * 2 hands
+
+        sequence.append(frame_keypoints)
+        frame_count += 1
+        
+        # Create sequences of 30 frames with 15 frames overlap
+        if len(sequence) == 30:
+            keypoints_sequences.append(sequence)
+            sequence = sequence[15:]  # Keep last 15 frames for overlap
+
+    cap.release()
+
+    if len(keypoints_sequences) == 0 and len(sequence) > 0:
+        # If we have some frames but not enough for a full sequence
+        # Pad the sequence to reach 30 frames
+        if len(sequence) < 30:
+            padding = [np.zeros(126) for _ in range(30 - len(sequence))]
+            sequence = sequence + padding
+        keypoints_sequences.append(sequence)
+    
+    if len(keypoints_sequences) == 0:
+        print(f"Warning: No keypoints extracted from video {video_path}")
+        return None
+
+    return np.array(keypoints_sequences)
+
+# Prepare dataset
+X = []
+y = []
+
+for gesture, label in LABELS.items():
+    gesture_dir = os.path.join(VIDEO_DIR, gesture)
+    if not os.path.isdir(gesture_dir):
+        print(f"Skipping non-directory: {gesture_dir}")
+        continue
+
+    print(f"Processing videos for gesture: {gesture}")
+    for video_file in os.listdir(gesture_dir):
+        if not video_file.lower().endswith(('.mp4', '.mkv', '.avi', '.mov')):
+            continue
+
+        video_path = os.path.join(gesture_dir, video_file)
+        sequences = extract_keypoints_from_video(video_path)
+        
+        if sequences is not None:
+            X.extend(sequences)
+            y.extend([label] * len(sequences))
+
+if len(X) == 0:
+    raise ValueError("No features were extracted. Check your video files and processing logic.")
+
+X = np.array(X)
+y = np.array(y)
+
+print(f"Feature dataset shape: {X.shape}")
+print(f"Label dataset shape: {y.shape}")
+
+# Split into training and validation sets
+X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
+
+# One-hot encode labels
+y_train = to_categorical(y_train, num_classes=len(LABELS))
+y_val = to_categorical(y_val, num_classes=len(LABELS))
+
+# Define the model with LSTM layers and L2 regularization
+model = Sequential([
+    LSTM(128, return_sequences=True, input_shape=(30, 126),
+         kernel_regularizer=l2(0.01)),
+    Dropout(0.4),
+    LSTM(64, kernel_regularizer=l2(0.01)),
+    Dropout(0.4),
+    Dense(32, activation='relu', kernel_regularizer=l2(0.01)),
+    Dropout(0.3),
+    Dense(len(LABELS), activation='softmax')
+])
+
+# Compile the model
+model.compile(
+    optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
+    loss='categorical_crossentropy',
+    metrics=['accuracy']
+)
+
+# Define callbacks
+callbacks = [
+    EarlyStopping(
+        monitor='val_loss',
+        patience=7,
+        restore_best_weights=True,
+        verbose=1
+    ),
+    ReduceLROnPlateau(
+        monitor='val_loss',
+        factor=0.5,
+        patience=3,
+        min_lr=0.00001,
+        verbose=1
+    )
+]
+
+# Calculate appropriate batch size based on dataset size
+batch_size = min(16, len(X_train) // 20)  # Aim for at least 20 updates per epoch
+batch_size = max(8, batch_size)  # But don't go smaller than 8
+
+# Train the model
+try:
+    history = model.fit(
+        X_train, y_train,
+        validation_data=(X_val, y_val),
+        epochs=20,  # Reduced from 50
+        batch_size=batch_size,
+        callbacks=callbacks,
+        shuffle=True
+    )
+except Exception as e:
+    print(f"Error during training: {e}")
+    raise
+
+# Add training history visualization
+def plot_training_history(history):
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
+    
+    # Plot accuracy
+    ax1.plot(history.history['accuracy'], label='Training Accuracy')
+    ax1.plot(history.history['val_accuracy'], label='Validation Accuracy')
+    ax1.set_title('Model Accuracy')
+    ax1.set_xlabel('Epoch')
+    ax1.set_ylabel('Accuracy')
+    ax1.legend()
+    
+    # Plot loss
+    ax2.plot(history.history['loss'], label='Training Loss')
+    ax2.plot(history.history['val_loss'], label='Validation Loss')
+    ax2.set_title('Model Loss')
+    ax2.set_xlabel('Epoch')
+    ax2.set_ylabel('Loss')
+    ax2.legend()
+    
+    plt.tight_layout()
+    plt.savefig('training_history.png')
+    plt.close()
+
+# Plot training history
+plot_training_history(history)
+
+# Save the model
+try:
+    model.save("isl_gesture_model123.h5")
+    print("Model saved successfully as isl_gesture_model.h5")
+except Exception as e:
+    print(f"Error saving the model: {e}")
+    raise
